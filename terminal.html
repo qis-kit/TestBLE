@@ -67,6 +67,9 @@
   .ok { color: var(--ok); }
   .sent { color: var(--accent); }
   form { display: flex; gap: 8px; }
+  /* previous / next command buttons: only on touch screens and narrow windows, where there is no arrow key */
+  .hist { display: none; padding: 8px 12px; }
+  @media (pointer: coarse), (max-width: 600px) { .hist { display: inline-block; } }
   input {
     flex: 1;
     min-width: 0;
@@ -94,6 +97,8 @@
 
   <form id="form" autocomplete="off">
     <input id="cmd" placeholder="Type a command, e.g. help" disabled>
+    <button type="button" id="histUp" class="secondary hist" aria-label="Previous command" disabled>&#9650;</button>
+    <button type="button" id="histDown" class="secondary hist" aria-label="Next command" disabled>&#9660;</button>
     <button id="send" disabled>Send</button>
   </form>
 
@@ -137,6 +142,7 @@ function setConnected(on) {
   statusEl.className = on ? 'on' : '';
   connectBtn.textContent = on ? 'Disconnect' : 'Connect';
   cmd.disabled = sendBtn.disabled = !on;
+  $('histUp').disabled = $('histDown').disabled = !on;
   $('connectAll').disabled = on;
   if (on) cmd.focus();
 }
@@ -976,14 +982,25 @@ $('form').addEventListener('submit', async e => {
   catch (err) { log('Send failed: ' + err.message + '\n', 'error'); }
 });
 
-cmd.addEventListener('keydown', e => {
-  if (e.key === 'ArrowUp' && histPos > 0) {
-    cmd.value = history[--histPos]; e.preventDefault();
-  } else if (e.key === 'ArrowDown') {
+// Command history: arrow up / down on a keyboard, or the two buttons next to Send on touch screens
+function historyStep(dir) {
+  if (dir < 0 && histPos > 0) {
+    cmd.value = history[--histPos];
+  } else if (dir > 0) {
     histPos = Math.min(histPos + 1, history.length);
-    cmd.value = history[histPos] || ''; e.preventDefault();
+    cmd.value = history[histPos] || '';
   }
+  cmd.setSelectionRange(cmd.value.length, cmd.value.length);
+}
+cmd.addEventListener('keydown', e => {
+  if (e.key === 'ArrowUp')        { historyStep(-1); e.preventDefault(); }
+  else if (e.key === 'ArrowDown') { historyStep(+1); e.preventDefault(); }
 });
+for (const [id, dir] of [['histUp', -1], ['histDown', +1]]) {
+  const b = $(id);
+  b.addEventListener('pointerdown', e => e.preventDefault());   // keep the focus (and the keyboard) in the input
+  b.addEventListener('click', () => { historyStep(dir); cmd.focus(); });
+}
 
 if (!navigator.bluetooth) {
   log('This browser does not support Web Bluetooth. Use Chrome or Edge on desktop or Android.\n', 'error');
