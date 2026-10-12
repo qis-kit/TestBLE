@@ -686,6 +686,27 @@ function onDisconnected() {
   rxChar = txChar = null;
 }
 
+// Everything after the device has been chosen. The first write ("time ...") is the first access to a
+// protected characteristic, so on a phone that is where the pairing dialog / notification appears.
+async function openSession() {
+  const server  = await device.gatt.connect();
+  const service = await server.getPrimaryService(NUS_SERVICE);
+  rxChar = await service.getCharacteristic(NUS_RX);
+  txChar = await service.getCharacteristic(NUS_TX);
+
+  txChar.addEventListener('characteristicvaluechanged', onData);
+  await txChar.startNotifications();
+
+  log('Connected to ' + (device.name || 'an unnamed device') + '\n', 'sys');
+  setConnected(true);
+  // Sync the ESP32 clock: Unix seconds plus this computer's UTC offset in minutes
+  const epoch = Math.floor(Date.now() / 1000);
+  const offsetMin = -new Date().getTimezoneOffset();
+  log('Syncing time...\n', 'sys');
+  await write('time ' + epoch + ' ' + offsetMin + '\n');
+  log('Tip: "pcloud put <file>" uploads a device file to pCloud, "upload" copies a file from this computer to the device.\n', 'sys');
+}
+
 async function connect(showAll = false) {
   if (!navigator.bluetooth) {
     log('Web Bluetooth is not available. Use Chrome or Edge on desktop or Android.\n', 'error');
@@ -700,24 +721,20 @@ async function connect(showAll = false) {
       : { filters: [{ namePrefix: 'ESP32' }], optionalServices: [NUS_SERVICE] });
     device.addEventListener('gattserverdisconnected', onDisconnected);
 
-    const server  = await device.gatt.connect();
-    const service = await server.getPrimaryService(NUS_SERVICE);
-    rxChar = await service.getCharacteristic(NUS_RX);
-    txChar = await service.getCharacteristic(NUS_TX);
-
-    txChar.addEventListener('characteristicvaluechanged', onData);
-    await txChar.startNotifications();
-
-    log('Connected to ' + (device.name || 'an unnamed device') + '\n', 'sys');
-    setConnected(true);
-    // Sync the ESP32 clock: Unix seconds plus this computer's UTC offset in minutes
-    const epoch = Math.floor(Date.now() / 1000);
-    const offsetMin = -new Date().getTimezoneOffset();
-    log('Syncing time...\n', 'sys');
-    await write('time ' + epoch + ' ' + offsetMin + '\n');
-    log('Tip: "pcloud put <file>" uploads a device file to pCloud, "upload" copies a file from this computer to the device.\n', 'sys');
+    try {
+      await openSession();
+    } catch (e1) {
+      // First connection after a fresh install: the OS pairs in the middle of the first protected
+      // access (on Android, look for the passkey request in the notification area), and the link is
+      // often dropped when pairing completes. Wait a moment and try once more with the new bond.
+      log('First attempt failed (' + e1.name + ': ' + e1.message + ').\n', 'error');
+      log('If your phone asks for a passkey (check the notification area), enter it now. Retrying in 5 s...\n', 'sys');
+      try { if (device.gatt.connected) device.gatt.disconnect(); } catch (ignored) {}
+      await sleep(5000);
+      await openSession();
+    }
   } catch (e) {
-    log('Connection failed: ' + e.message + '\n', 'error');
+    log('Connection failed: ' + e.name + ': ' + e.message + '\n', 'error');
     if (/No Services matching/i.test(e.message)) {
       log('That device is not running the terminal service (Nordic UART). Is the right firmware on it?\n', 'sys');
     }
