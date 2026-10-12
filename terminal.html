@@ -878,32 +878,38 @@ async function connect(showAll = false) {
     return;
   }
   try {
+    // On Android, reconnect to the device chosen a moment ago without scanning again (fewer Android scan
+    // problems). After two minutes, on other systems, or with "All devices", the device dialog is shown.
+    const isAndroid = /Android/i.test(navigator.userAgent);
+    const canReuse = isAndroid && device && !device.gatt.connected && !showAll && lastDisconnectAt &&
+                     (Date.now() - lastDisconnectAt < 120000);
+
+    if (!canReuse) {
+      // The device dialog may only be opened straight from the click, so do it before anything that waits.
+      log('Choose your ESP32-S3 in the Bluetooth dialog...\n', 'sys');
+      // Normal mode only lists devices whose advertised name starts with "ESP32".
+      // "All devices" lists every BLE device, which helps when a board does not show up.
+      device = await navigator.bluetooth.requestDevice(showAll
+        ? { acceptAllDevices: true, optionalServices: [NUS_SERVICE] }
+        : { filters: [{ namePrefix: 'ESP32' }], optionalServices: [NUS_SERVICE] });
+      device.addEventListener('gattserverdisconnected', onDisconnected);
+    }
+
     // Give Android a moment after the last session ended; reconnecting instantly fails more often.
     const sinceLast = Date.now() - lastDisconnectAt;
-    if (sinceLast < 2000) await sleep(2000 - sinceLast);
+    if (isAndroid && sinceLast < 2000) await sleep(2000 - sinceLast);
 
-    // Reconnect to the device chosen a moment ago without scanning again (fewer Android scan problems).
-    // After two minutes, or with "All devices", the device dialog is shown again.
-    const canReuse = device && !device.gatt.connected && !showAll && lastDisconnectAt &&
-                     (Date.now() - lastDisconnectAt < 120000);
     if (canReuse) {
       log('Reconnecting to ' + (device.name || 'the last device') + '...\n', 'sys');
       try {
         await connectWithRetries(3);
-        return;
       } catch (e) {
-        log('Reconnect failed, please choose the device again.\n', 'sys');
+        // A new device dialog needs a fresh click (the browser rejects it after waiting), so ask for one.
         device = null;
+        log('Reconnect failed. Click Connect again and choose the device from the list.\n', 'error');
       }
+      return;
     }
-
-    log('Choose your ESP32-S3 in the Bluetooth dialog...\n', 'sys');
-    // Normal mode only lists devices whose advertised name starts with "ESP32".
-    // "All devices" lists every BLE device, which helps when a board does not show up.
-    device = await navigator.bluetooth.requestDevice(showAll
-      ? { acceptAllDevices: true, optionalServices: [NUS_SERVICE] }
-      : { filters: [{ namePrefix: 'ESP32' }], optionalServices: [NUS_SERVICE] });
-    device.addEventListener('gattserverdisconnected', onDisconnected);
     await connectWithRetries(4);
   } catch (e) {
     log('Connection failed: ' + e.name + ': ' + e.message + '\n', 'error');
