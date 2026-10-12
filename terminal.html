@@ -727,10 +727,15 @@ async function connect(showAll = false) {
       // First connection after a fresh install: the OS pairs in the middle of the first protected
       // access (on Android, look for the passkey request in the notification area), and the link is
       // often dropped when pairing completes. Wait a moment and try once more with the new bond.
+      // A plain "connection attempt failed" is usually a one-off on Android: retry quickly.
+      // Anything else may be pairing in progress: give the passkey dialog more time.
+      const quick = /connection attempt failed/i.test(e1.message);
+      const waitMs = quick ? 1500 : 5000;
       log('First attempt failed (' + e1.name + ': ' + e1.message + ').\n', 'error');
-      log('If your phone asks for a passkey (check the notification area), enter it now. Retrying in 5 s...\n', 'sys');
+      if (!quick) log('If your phone asks for a passkey (check the notification area), enter it now.\n', 'sys');
+      log('Retrying in ' + (waitMs / 1000) + ' s...\n', 'sys');
       try { if (device.gatt.connected) device.gatt.disconnect(); } catch (ignored) {}
-      await sleep(5000);
+      await sleep(waitMs);
       await openSession();
     }
   } catch (e) {
