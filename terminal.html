@@ -746,6 +746,14 @@ function disconnect() {
   if (device && device.gatt.connected) device.gatt.disconnect();
 }
 
+// Close the BLE link when the page is reloaded or closed. Chrome on Android can leave it open, which
+// keeps the ESP32 busy and makes the next connection fail.
+function closeLink() {
+  try { if (device && device.gatt.connected) device.gatt.disconnect(); } catch (e) {}
+}
+window.addEventListener('pagehide', closeLink);
+window.addEventListener('beforeunload', closeLink);
+
 let writeChunk = 20;   // raised to MTU-3 once the device reports its MTU (see negotiateWriteSize)
 async function writeBytes(bytes) {
   // Stay within the ATT payload; writes with response so the OS can start pairing when needed
