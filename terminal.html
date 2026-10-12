@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32-S3 terminal</title>
+<style>
+  :root {
+    --bg: #1b2230;
+    --panel: #232c3d;
+    --text: #e4e8f0;
+    --muted: #8a95ab;
+    --accent: #f2b84b;
+    --err: #ff8a80;
+    --ok: #7fd1ae;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
+    display: flex;
+    flex-direction: column;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 12px;
+    gap: 10px;
+  }
+  header { display: flex; align-items: center; gap: 12px; }
+  h1 { font-size: 16px; font-weight: 600; margin: 0; flex: 1; }
+  #status { color: var(--muted); }
+  #status.on { color: var(--ok); }
+  button {
+    background: var(--accent);
+    color: #1b2230;
+    border: 0;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button.secondary { background: var(--panel); color: var(--text); }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #out {
+    flex: 1;
+    overflow-y: auto;
+    background: var(--panel);
+    border-radius: 8px;
+    padding: 12px;
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .sys { color: var(--muted); }
+  .error { color: var(--err); }
+  .ok { color: var(--ok); }
+  .sent { color: var(--accent); }
+  form { display: flex; gap: 8px; }
+  input {
+    flex: 1;
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid #36425a;
+    border-radius: 6px;
+    padding: 10px 12px;
+    font: inherit;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1>ESP32-S3 terminal</h1>
+    <span id="status">Disconnected</span>
+    <button id="connect">Connect</button>
+    <button id="connectAll" class="secondary" title="List every Bluetooth LE device nearby (for troubleshooting)">All devices</button>
+    <button id="clear" class="secondary">Clear</button>
+  </header>
+
+  <pre id="out" aria-live="polite"></pre>
+
+  <form id="form" autocomplete="off">
+    <input id="cmd" placeholder="Type a command, e.g. help" disabled>
+    <button id="send" disabled>Send</button>
+  </form>
+
+<script>
+const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const NUS_RX      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // we write here
+const NUS_TX      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // we get notifications here
+
+const $ = id => document.getElementById(id);
+const out = $('out'), cmd = $('cmd'), statusEl = $('status');
+const connectBtn = $('connect'), sendBtn = $('send');
+
+let device = null, rxChar = null, txChar = null;
+const decoder = new TextDecoder();
+const encoder = new TextEncoder();
+const history = [];
+let histPos = 0;
+
+function ensureNewline() {
+  const last = out.lastChild;
+  if (last && !last.textContent.endsWith('\n')) {
+    const nl = document.createElement('span');
+    nl.textContent = '\n';
+    out.appendChild(nl);
+  }
+}
+
+function log(text, cls) {
+  if (text && cls && cls !== 'sent') ensureNewline();   // device prompts ("> ") must not glue to our messages
+  const span = document.createElement('span');
+  if (cls) span.className = cls;
+  span.textContent = text;
+  out.appendChild(span);
+  out.scrollTop = out.scrollHeight;
+  return span;
+}
+
+function setConnected(on) {
+  statusEl.textContent = on ? 'Connected' : 'Disconnected';
+  statusEl.className = on ? 'on' : '';
+  connectBtn.textContent = on ? 'Disconnect' : 'Connect';
+  cmd.disabled = sendBtn.disabled = !on;
+  $('connectAll').disabled = on;
+  if (on) cmd.focus();
+}
+
+// ---- framed binary transfers from the ESP32 ----
+// Frame: "@BEGIN <size> <total> <name>\r\n" + <size> raw bytes + "\r\n@END <crc32 hex>\r\n"   |   "@ERR <message>\r\n"
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+let pending = null;   // the one transfer in flight, if any
+const TRANSFER_IDLE_MS = 15000;
+
+function armTimeout() {
+  clearTimeout(pending.timer);
+  pending.timer = setTimeout(() => finishPending(new Error('device stopped responding')), pending.idleMs);
+}
+
+function finishPending(err, result) {
+  if (!pending) return;
+  const p = pending;
+  pending = null;
+  clearTimeout(p.timer);
+  if (err) {
+    err.got = p.got;      // how far the transfer got, for the summary
+    err.size = p.size;
+    p.reject(err);
+  } else {
+    p.resolve(result);
+  }
+}
+
+// Send a command and collect the framed reply (nothing from it is shown in the terminal).
+// command: a text line, or a Uint8Array of raw payload bytes.
+// handlers: { onBegin(size, total, name), onProgress(receivedBytes, size), idleMs, accept(okText) }
+function request(command, handlers = {}) {
+  return new Promise((resolve, reject) => {
+    if (pending) return reject(new Error('another transfer is in progress'));
+    pending = { resolve, reject, onBegin: handlers.onBegin, onProgress: handlers.onProgress,
+                idleMs: handlers.idleMs || TRANSFER_IDLE_MS, accept: handlers.accept,
+                state: 'header', head: '', tail: '', size: 0, total: 0, name: '', body: null, got: 0, timer: null };
+    armTimeout();
+    (typeof command === 'string' ? write(command + '\n') : writeBytes(command)).catch(e => finishPending(e));
+  });
+}
+
+function feed(bytes) {
+  const p = pending;
+  let i = 0;
+  armTimeout();
+  while (i < bytes.length && pending === p) {
+    if (p.state === 'header') {
+      const b = bytes[i++];
+      p.head += String.fromCharCode(b);
+      if (b === 10) {
+        const err = /@ERR (.*)/.exec(p.head);
+        const begin = /@BEGIN (\d+) (\d+) (.*)/.exec(p.head);
+        const okm = /@OK (.*)/.exec(p.head);
+        if (err) {
+          const de = new Error(err[1].trim() || 'device error');
+          de.fatal = !/^crc mismatch/i.test(de.message);   // a refusal: retrying will not help (a bad CRC can be retried)
+          finishPending(de);
+        } else if (begin) {
+          p.size = parseInt(begin[1], 10);
+          p.total = parseInt(begin[2], 10);
+          p.name = begin[3].trim();
+          p.body = new Uint8Array(p.size);
+          p.state = p.size ? 'body' : 'tail';
+          if (p.onBegin) p.onBegin(p.size, p.total, p.name);
+        } else if (okm) {
+          const text = okm[1].trim();
+          if (!p.accept || p.accept(text)) finishPending(null, { ok: text });
+          else p.head = '';      // a stale reply from an earlier attempt: keep waiting
+        } else {
+          p.head = '';   // stray text such as a late prompt or the time reply
+        }
+      }
+    } else if (p.state === 'body') {
+      const n = Math.min(bytes.length - i, p.size - p.got);
+      p.body.set(bytes.subarray(i, i + n), p.got);
+      p.got += n;
+      i += n;
+      if (p.onProgress) p.onProgress(p.got, p.size);
+      if (p.got === p.size) p.state = 'tail';
+    } else {
+      const b = bytes[i++];
+      p.tail += String.fromCharCode(b);
+      if (b === 10 && p.tail.includes('@END')) {
+        const m = /@END ([0-9a-f]{8})/.exec(p.tail);
+        const got = crc32(p.body).toString(16).padStart(8, '0');
+        if (!m || m[1] !== got) finishPending(new Error('checksum mismatch, transfer corrupted'));
+        else finishPending(null, { name: p.name, data: p.body, total: p.total });
+      }
+    }
+  }
+  if (i < bytes.length) showDeviceText(bytes.subarray(i));  // e.g. the next prompt
+}
+
+let swallowPrompts = false;   // true while a pcloud run is active
+function showDeviceText(bytes) {
+  const t = decoder.decode(bytes, { stream: true });
+  if (swallowPrompts && /^\s*>\s*$/.test(t)) return;
+  log(t);
+}
+
+function onData(event) {
+  const dv = event.target.value;
+  const bytes = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+  if (pending) feed(bytes);
+  else showDeviceText(bytes);
+}
+
+// ---- progress, summary and the pcloud command ----
+const fmt = n => Math.round(n).toLocaleString();
+const secs = ms => (ms / 1000).toFixed(1) + ' s';
+const rate = (bytes, ms) => ms > 0 ? ', ' + (bytes / 1024 / (ms / 1000)).toFixed(1) + ' KB/s' : '';
+
+// One line in the terminal that is updated in place (at most ~10 times per second)
+function makeProgress(label) {
+  ensureNewline();
+  const el = log('', 'sys');
+  let last = 0;
+  return {
+    update(done, total, force) {
+      const now = performance.now();
+      if (!force && now - last < 100) return;
+      last = now;
+      const pct = total ? Math.floor(done * 100 / total) : 100;
+      el.textContent = (total
+        ? label + ': ' + fmt(done) + ' of ' + fmt(total) + ' bytes (' + pct + '%)'
+        : label + ': ' + fmt(done) + ' bytes') + '\n';
+      out.scrollTop = out.scrollHeight;
+    },
+    finish(text, cls) {
+      el.textContent = text + '\n';
+      if (cls) el.className = cls;
+      out.scrollTop = out.scrollHeight;
+    }
+  };
+}
+
+// fetch() cannot report upload progress, XMLHttpRequest can
+function postWithProgress(url, form, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url);
+    xhr.timeout = 10 * 60 * 1000;
+    xhr.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded, e.total); };
+    xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText });
+    xhr.onerror = () => reject(new Error('could not reach the server (offline, blocked, or CORS; see the browser console)'));
+    xhr.ontimeout = () => reject(new Error('upload timed out'));
+    xhr.onabort = () => reject(new Error('upload cancelled'));
+    xhr.send(form);
+  });
+}
+
+const retryText = n => n ? ', ' + n + ' chunk ' + (n === 1 ? 'retry' : 'retries') : '';
+const STEP_LABEL = { token: 'fetching the token', receive: 'the BLE file transfer', upload: 'the pCloud upload' };
+
+function printSummary(ok, s, err, folderId) {
+  const L = [ok ? 'Summary: SUCCESS' : 'Summary: FAILED during ' + STEP_LABEL[s.step]];
+  L.push('  File:    ' + s.file);
+  if (s.step === 'receive') {
+    L.push('  BLE:     ' + (s.received || s.size
+      ? fmt(s.received) + (s.size ? ' of ' + fmt(s.size) : '') + ' bytes received before the failure' + retryText(s.retries)
+      : 'no data received'));
+  } else if (s.step === 'upload') {
+    L.push('  BLE:     ' + fmt(s.size) + ' bytes received, checksums OK, ' + secs(s.recvMs) + rate(s.size, s.recvMs) + retryText(s.retries));
+    L.push('  pCloud:  ' + (ok
+      ? fmt(s.size) + ' bytes uploaded to folder ' + folderId + ', ' + secs(s.upMs) + rate(s.size, s.upMs)
+      : s.uploaded >= s.size
+        ? 'all ' + fmt(s.size) + ' bytes sent, but the upload was not accepted'
+        : fmt(s.uploaded) + ' of ' + fmt(s.size) + ' bytes sent before the failure'));
+  }
+  if (!ok) L.push('  Reason:  ' + err.message);
+  log(L.join('\n') + '\n', ok ? 'ok' : 'error');
+}
+
+// ---- file download in checksummed chunks, with retries ----
+const CHUNK_BYTES = 1024;    // every chunk is its own request with its own CRC-32
+const CHUNK_IDLE_MS = 5000;  // give up on a chunk if nothing arrives for this long
+const CHUNK_RETRIES = 3;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function fetchFile(path, handlers = {}) {
+  let total = -1, offset = 0, name = path.split('/').pop(), data = null, retries = 0;
+  try {
+    while (total < 0 || offset < total) {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const r = await request('get ' + path + ' ' + offset + ' ' + CHUNK_BYTES, {
+            idleMs: CHUNK_IDLE_MS,
+            onBegin: (len, tot, nm) => {
+              if (total < 0) {
+                total = tot;
+                name = nm;
+                data = new Uint8Array(tot);
+                if (handlers.onBegin) handlers.onBegin(tot, nm);
+              }
+            },
+            onProgress: got => { if (handlers.onProgress) handlers.onProgress(offset + got, total); }
+          });
+          if (r.data.length === 0 && offset < r.total) {
+            const empty = new Error('device returned no data');
+            empty.fatal = true;
+            throw empty;
+          }
+          data.set(r.data, offset);
+          offset += r.data.length;
+          break;
+        } catch (e) {
+          if (e.fatal || attempt >= CHUNK_RETRIES) throw e;
+          retries++;
+          await sleep(400);   // let anything still in flight from the failed attempt drain
+        }
+      }
+    }
+  } catch (e) {
+    e.got = offset;                      // file-level numbers for the summary
+    e.size = total > 0 ? total : 0;
+    e.retries = retries;
+    throw e;
+  }
+  return { name, data, retries };
+}
+
+// pcloud <file> [folderid]: the browser does the upload, the ESP32 only supplies data
+async function runPcloudPut(args) {
+  const path = args[0];
+  const folderId = args[1] === undefined ? '0' : args[1];
+  if (!path || !/^\d+$/.test(folderId)) {
+    log('usage: pcloud put <file> [folderid]   (folderid 0 = root)\n' +
+        '       pcloud get <path in pCloud> [device file]\n' +
+        '       upload [device file]   (choose a file on this computer)\n', 'error');
+    return;
+  }
+
+  const s = { step: 'token', file: path, size: 0, received: 0, uploaded: 0, recvMs: 0, upMs: 0, retries: 0 };
+  let recv = null, up = null;
+  swallowPrompts = true;
+  try {
+    log('Fetching token from the device...\n', 'sys');
+    const tok = await request('token');
+    const [token, host] = new TextDecoder().decode(tok.data).split('\n').map(x => x.trim());
+    const apiHost = host || 'eapi.pcloud.com';
+
+    s.step = 'receive';
+    const t0 = performance.now();
+    const file = await fetchFile(path, {
+      onBegin: (size, name) => {
+        s.size = size;
+        s.file = name;
+        recv = makeProgress('Receiving ' + name + ' over BLE');
+        recv.update(0, size, true);
+      },
+      onProgress: (got, size) => { s.received = got; if (recv) recv.update(got, size); }
+    });
+    s.recvMs = performance.now() - t0;
+    s.received = file.data.length;
+    s.retries = file.retries;
+    recv.finish('Received ' + file.name + ': ' + fmt(s.received) + ' bytes over BLE, checksums OK' + (s.retries ? ' (' + s.retries + ' retried)' : ''), 'sys');
+
+    s.step = 'upload';
+    up = makeProgress('Uploading ' + file.name + ' to ' + apiHost);
+    up.update(0, s.size, true);
+    const form = new FormData();      // parameters first, then the file, as pCloud requires
+    form.append('access_token', token);
+    form.append('folderid', folderId);
+    form.append('nopartial', '1');
+    form.append('file', new Blob([file.data]), file.name);
+
+    const t1 = performance.now();
+    const res = await postWithProgress('https://' + apiHost + '/uploadfile', form, (loaded, total) => {
+      s.uploaded = Math.min(s.size, Math.round(loaded / total * s.size));
+      up.update(s.uploaded, s.size);
+    });
+    s.upMs = performance.now() - t1;
+
+    let json;
+    try { json = JSON.parse(res.text); }
+    catch { throw new Error('unexpected reply from pCloud (HTTP ' + res.status + ')'); }
+    if (json.result !== 0) throw new Error('pCloud error ' + json.result + ': ' + (json.error || 'unknown'));
+
+    s.uploaded = s.size;
+    up.finish('Uploaded ' + file.name + ': ' + fmt(s.size) + ' bytes to pCloud folder ' + folderId, 'sys');
+    printSummary(true, s, null, folderId);
+  } catch (e) {
+    if (s.step === 'receive' && e.got !== undefined) s.received = e.got;
+    if (e.retries !== undefined) s.retries = e.retries;
+    if (s.step === 'receive' && e.size) s.size = e.size;
+    if (s.step === 'receive' && recv) recv.finish('Receiving ' + s.file + ': stopped at ' + fmt(s.received) + ' of ' + fmt(s.size) + ' bytes', 'error');
+    if (s.step === 'upload' && up) {
+      up.finish(s.uploaded >= s.size
+        ? 'Uploading ' + s.file + ': all ' + fmt(s.size) + ' bytes sent, but the upload was not accepted'
+        : 'Uploading ' + s.file + ': stopped at ' + fmt(s.uploaded) + ' of ' + fmt(s.size) + ' bytes', 'error');
+    }
+    printSummary(false, s, e, folderId);
+  } finally {
+    swallowPrompts = false;
+  }
+}
+
+// ---- sending files to the device: "put" in checksummed chunks ----
+// Each chunk: text line "put <file> <total> <offset> <len> <crc> <id>", wait for "@OK go <id>",
+// then the raw bytes, then wait for "@OK <offset+len>". The bytes are only sent after "go", so the
+// device can never mistake file contents for commands.
+const PUT_CHUNK = 1024;          // must not exceed RXBIN_MAX in the firmware
+const PUT_IDLE_MS = 6000;
+const PUT_RETRY_WAIT_MS = 3500;  // longer than the firmware's 3 s payload timeout
+let putId = 0;
+
+async function negotiateWriteSize() {
+  try {
+    const r = await request('mtu', { accept: t => t.startsWith('mtu ') });
+    const m = /mtu (\d+)/.exec(r.ok);
+    if (m) writeChunk = Math.max(20, Math.min(parseInt(m[1], 10) - 3, 244));
+  } catch (e) {
+    writeChunk = 20;
+  }
+}
+
+async function putFile(path, bytes, handlers = {}) {
+  const total = bytes.length;
+  let offset = 0, retries = 0;
+  try {
+    await negotiateWriteSize();
+    while (offset < total) {
+      const len = Math.min(PUT_CHUNK, total - offset);
+      const chunk = bytes.subarray(offset, offset + len);
+      const crc = crc32(chunk).toString(16).padStart(8, '0');
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const id = ++putId;
+          await request('put ' + path + ' ' + total + ' ' + offset + ' ' + len + ' ' + crc + ' ' + id,
+                        { idleMs: PUT_IDLE_MS, accept: t => t === 'go ' + id });
+          await request(chunk, { idleMs: PUT_IDLE_MS, accept: t => t === String(offset + len) });
+          break;
+        } catch (e) {
+          if (e.fatal || attempt >= CHUNK_RETRIES) throw e;
+          retries++;
+          // after a timeout the device may still be waiting for payload bytes, so wait it out
+          await sleep(/stopped responding/.test(e.message) ? PUT_RETRY_WAIT_MS : 300);
+        }
+      }
+      offset += len;
+      if (handlers.onProgress) handlers.onProgress(offset, total);
+    }
+    await request('commit ' + path + ' ' + total, { idleMs: PUT_IDLE_MS, accept: t => t.startsWith('committed') });
+  } catch (e) {
+    if (/stopped responding/.test(e.message)) await sleep(PUT_RETRY_WAIT_MS);
+    try { await request('abort ' + path, { idleMs: 3000, accept: t => t === 'aborted' }); } catch (ignored) {}  // remove the partial file
+    e.got = offset;
+    e.size = total;
+    e.retries = retries;
+    throw e;
+  }
+  return { retries };
+}
+
+// ---- helpers for the pcloud get / upload commands ----
+function parseArgs(text) {    // words separated by spaces; "double quotes" keep spaces inside one word
+  const out = [];
+  const re = /"([^"]*)"|(\S+)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) out.push(m[1] !== undefined ? m[1] : m[2]);
+  return out;
+}
+
+function pickFile() {         // must be called straight from the Enter key press (user gesture)
+  return new Promise(resolve => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.addEventListener('change', () => resolve(input.files[0] || null));
+    input.addEventListener('cancel', () => resolve(null));
+    input.click();
+  });
+}
+
+function downloadWithProgress(url, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', url);
+    xhr.responseType = 'arraybuffer';
+    xhr.timeout = 10 * 60 * 1000;
+    xhr.onprogress = e => onProgress(e.loaded, e.lengthComputable ? e.total : 0);
+    xhr.onload = () => xhr.status === 200
+      ? resolve(new Uint8Array(xhr.response))
+      : reject(new Error('download failed (HTTP ' + xhr.status + ')'));
+    xhr.onerror = () => reject(new Error('could not download from the pCloud content server (blocked or CORS; see the browser console)'));
+    xhr.ontimeout = () => reject(new Error('download timed out'));
+    xhr.onabort = () => reject(new Error('download cancelled'));
+    xhr.send();
+  });
+}
+
+// Copies bytes to a file on the device and records the numbers for the summary
+async function sendToDevice(local, data, s) {
+  s.step = 'send';
+  s.size = data.length;
+  const prog = makeProgress('Sending ' + local + ' to the device');
+  prog.update(0, data.length, true);
+  const t0 = performance.now();
+  try {
+    const r = await putFile(local, data, { onProgress: (done, total) => { s.sent = done; prog.update(done, total); } });
+    s.sendMs = performance.now() - t0;
+    s.sent = data.length;
+    s.retries = r.retries;
+    prog.finish('Sent ' + local + ': ' + fmt(data.length) + ' bytes over BLE, checksums OK' +
+                (s.retries ? ' (' + s.retries + ' retried)' : ''), 'sys');
+  } catch (e) {
+    if (e.got !== undefined) s.sent = e.got;
+    if (e.retries !== undefined) s.retries = e.retries;
+    prog.finish('Sending ' + local + ': stopped at ' + fmt(s.sent) + ' of ' + fmt(data.length) + ' bytes', 'error');
+    throw e;
+  }
+}
+
+const SEND_STEP = { token: 'fetching the token', link: 'getting the download link',
+                    download: 'the pCloud download', send: 'the BLE transfer to the device' };
+
+function printSendSummary(ok, s, err) {
+  const L = [ok ? 'Summary: SUCCESS' : 'Summary: FAILED during ' + SEND_STEP[s.step]];
+  L.push('  File:    ' + s.source + ' -> ' + s.local);
+  if (s.fromPcloud && s.step === 'download') {
+    L.push('  pCloud:  ' + fmt(s.downloaded) + (s.size ? ' of ' + fmt(s.size) : '') + ' bytes downloaded before the failure');
+  } else if (s.fromPcloud && s.step === 'send') {
+    L.push('  pCloud:  ' + fmt(s.size) + ' bytes downloaded, ' + secs(s.downMs) + rate(s.size, s.downMs));
+  }
+  if (s.step === 'send') {
+    L.push('  BLE:     ' + (ok
+      ? fmt(s.size) + ' bytes sent and committed, checksums OK, ' + secs(s.sendMs) + rate(s.size, s.sendMs)
+      : fmt(s.sent) + ' of ' + fmt(s.size) + ' bytes sent before the failure') + retryText(s.retries));
+  }
+  if (!ok) L.push('  Reason:  ' + err.message);
+  log(L.join('\n') + '\n', ok ? 'ok' : 'error');
+}
+
+// pcloud get <path in pCloud> [device file]: pCloud -> browser -> BLE -> LittleFS
+async function runPcloudGet(args) {
+  let remote = args[0];
+  if (!remote) {
+    log('usage: pcloud get <path in pCloud> [device file]   (quotes around names with spaces)\n', 'error');
+    return;
+  }
+  if (!remote.startsWith('/')) remote = '/' + remote;
+  let local = args[1] || '/' + remote.split('/').pop();
+  if (!local.startsWith('/')) local = '/' + local;
+  if (/\s/.test(local)) {
+    log('Device file names cannot contain spaces. Give one as the second argument.\n', 'error');
+    return;
+  }
+
+  const s = { fromPcloud: true, step: 'token', source: remote, local, size: 0, downloaded: 0,
+              downMs: 0, sent: 0, sendMs: 0, retries: 0 };
+  let down = null;
+  swallowPrompts = true;
+  try {
+    log('Fetching token from the device...\n', 'sys');
+    const tok = await request('token');
+    const [token, host] = new TextDecoder().decode(tok.data).split('\n').map(x => x.trim());
+    const apiHost = host || 'eapi.pcloud.com';
+
+    s.step = 'link';
+    log('Asking pCloud for a download link...\n', 'sys');
+    let info;
+    try {
+      const res = await fetch('https://' + apiHost + '/getfilelink?' +
+                              new URLSearchParams({ path: remote, access_token: token }));
+      info = await res.json();
+    } catch (e) {
+      throw new Error('could not get a download link (' + e.message + '). pCloud documents getfilelink as ' +
+                      'not usable from web pages, so the browser may be blocking it. Download the file ' +
+                      'manually and use: upload ' + local);
+    }
+    if (info.result === 7010) {
+      throw new Error('pCloud refuses download links for web pages (error 7010, Invalid link referer). ' +
+                      'This is a pCloud restriction, not something this page can change. ' +
+                      'Download the file with the pCloud website or app instead, then use: upload ' + local);
+    }
+    if (info.result !== 0) throw new Error('pCloud error ' + info.result + ': ' + (info.error || 'unknown'));
+    if (!info.hosts || !info.hosts.length) throw new Error('pCloud returned no download server');
+
+    s.step = 'download';
+    down = makeProgress('Downloading ' + remote + ' from pCloud');
+    const t0 = performance.now();
+    const data = await downloadWithProgress('https://' + info.hosts[0] + info.path, (done, total) => {
+      s.downloaded = done;
+      if (total) s.size = total;
+      down.update(done, total);
+    });
+    s.downMs = performance.now() - t0;
+    s.size = s.downloaded = data.length;
+    down.finish('Downloaded ' + remote + ': ' + fmt(data.length) + ' bytes from pCloud', 'sys');
+
+    await sendToDevice(local, data, s);
+    printSendSummary(true, s);
+  } catch (e) {
+    if (s.step === 'download' && down) {
+      down.finish('Downloading ' + remote + ': stopped at ' + fmt(s.downloaded) +
+                  (s.size ? ' of ' + fmt(s.size) : '') + ' bytes', 'error');
+    }
+    printSendSummary(false, s, e);
+  } finally {
+    swallowPrompts = false;
+  }
+}
+
+// upload [device file]: choose a file on this computer and copy it to the device's LittleFS
+async function runUpload(text) {
+  const filePromise = pickFile();     // open the picker right away, while the key press still counts
+  const args = parseArgs(text).slice(1);
+  const file = await filePromise;
+  if (!file) { log('No file chosen.\n', 'sys'); return; }
+  let local = args[0] || '/' + file.name;
+  if (!local.startsWith('/')) local = '/' + local;
+  if (/\s/.test(local)) {
+    log('Device file names cannot contain spaces. Use: upload /name.ext\n', 'error');
+    return;
+  }
+
+  const s = { fromPcloud: false, step: 'send', source: file.name, local, size: file.size, sent: 0, sendMs: 0, retries: 0 };
+  swallowPrompts = true;
+  try {
+    const data = new Uint8Array(await file.arrayBuffer());
+    await sendToDevice(local, data, s);
+    printSendSummary(true, s);
+  } catch (e) {
+    printSendSummary(false, s, e);
+  } finally {
+    swallowPrompts = false;
+  }
+}
+
+// pcloud put <file> [folderid]  |  pcloud get <remote> [device file]  |  pcloud <file> [folderid]
+async function runPcloud(text) {
+  const args = parseArgs(text).slice(1);
+  if (args[0] === 'get') return runPcloudGet(args.slice(1));
+  if (args[0] === 'put') return runPcloudPut(args.slice(1));
+  return runPcloudPut(args);
+}
+
+function onDisconnected() {
+  const gone = new Error('disconnected');
+  gone.fatal = true;
+  finishPending(gone);
+  writeChunk = 20;
+  log('\nDisconnected.\n', 'sys');
+  setConnected(false);
+  rxChar = txChar = null;
+}
+
+async function connect(showAll = false) {
+  if (!navigator.bluetooth) {
+    log('Web Bluetooth is not available. Use Chrome or Edge on desktop or Android.\n', 'error');
+    return;
+  }
+  try {
+    log('Choose your ESP32-S3 in the Bluetooth dialog...\n', 'sys');
+    // Normal mode only lists devices whose advertised name starts with "ESP32".
+    // "All devices" lists every BLE device, which helps when a board does not show up.
+    device = await navigator.bluetooth.requestDevice(showAll
+      ? { acceptAllDevices: true, optionalServices: [NUS_SERVICE] }
+      : { filters: [{ namePrefix: 'ESP32' }], optionalServices: [NUS_SERVICE] });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+
+    const server  = await device.gatt.connect();
+    const service = await server.getPrimaryService(NUS_SERVICE);
+    rxChar = await service.getCharacteristic(NUS_RX);
+    txChar = await service.getCharacteristic(NUS_TX);
+
+    txChar.addEventListener('characteristicvaluechanged', onData);
+    await txChar.startNotifications();
+
+    log('Connected to ' + (device.name || 'an unnamed device') + '\n', 'sys');
+    setConnected(true);
+    // Sync the ESP32 clock: Unix seconds plus this computer's UTC offset in minutes
+    const epoch = Math.floor(Date.now() / 1000);
+    const offsetMin = -new Date().getTimezoneOffset();
+    log('Syncing time...\n', 'sys');
+    await write('time ' + epoch + ' ' + offsetMin + '\n');
+    log('Tip: "pcloud put <file>" uploads a device file to pCloud, "upload" copies a file from this computer to the device.\n', 'sys');
+  } catch (e) {
+    log('Connection failed: ' + e.message + '\n', 'error');
+    if (/No Services matching/i.test(e.message)) {
+      log('That device is not running the terminal service (Nordic UART). Is the right firmware on it?\n', 'sys');
+    }
+    log('First time? Finish pairing in the system dialog (enter the passkey set in the firmware), then click Connect again.\n', 'sys');
+  }
+}
+
+function disconnect() {
+  if (device && device.gatt.connected) device.gatt.disconnect();
+}
+
+let writeChunk = 20;   // raised to MTU-3 once the device reports its MTU (see negotiateWriteSize)
+async function writeBytes(bytes) {
+  // Stay within the ATT payload; writes with response so the OS can start pairing when needed
+  for (let i = 0; i < bytes.length; i += writeChunk) {
+    await rxChar.writeValueWithResponse(bytes.slice(i, i + writeChunk));
+  }
+}
+function write(text) {
+  return writeBytes(encoder.encode(text));
+}
+
+$('connectAll').addEventListener('click', () => { if (!(device && device.gatt.connected)) connect(true); });
+connectBtn.addEventListener('click', () => {
+  device && device.gatt.connected ? disconnect() : connect();
+});
+$('clear').addEventListener('click', () => { out.textContent = ''; });
+
+$('form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const text = cmd.value;
+  if (!text.trim() || !rxChar) return;
+  history.push(text);
+  histPos = history.length;
+  log(text + '\n', 'sent');
+  cmd.value = '';
+  if (/^pcloud(\s|$)/.test(text.trim())) { await runPcloud(text); return; }
+  if (/^upload(\s|$)/.test(text.trim())) { await runUpload(text); return; }
+  if (pending) { log('A transfer is in progress, please wait.\n', 'error'); return; }
+  try { await write(text + '\n'); }
+  catch (err) { log('Send failed: ' + err.message + '\n', 'error'); }
+});
+
+cmd.addEventListener('keydown', e => {
+  if (e.key === 'ArrowUp' && histPos > 0) {
+    cmd.value = history[--histPos]; e.preventDefault();
+  } else if (e.key === 'ArrowDown') {
+    histPos = Math.min(histPos + 1, history.length);
+    cmd.value = history[histPos] || ''; e.preventDefault();
+  }
+});
+
+if (!navigator.bluetooth) {
+  log('This browser does not support Web Bluetooth. Use Chrome or Edge on desktop or Android.\n', 'error');
+}
+</script>
+</body>
+</html>
