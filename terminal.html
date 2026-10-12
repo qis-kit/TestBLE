@@ -95,6 +95,7 @@ const out = $('out'), cmd = $('cmd'), statusEl = $('status');
 const connectBtn = $('connect'), sendBtn = $('send');
 
 let device = null, rxChar = null, txChar = null;
+let lastDisconnectAt = 0;   // when the last BLE session ended (used to pace reconnects)
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 const history = [];
@@ -361,6 +362,144 @@ async function fetchFile(path, handlers = {}) {
   return { name, data, retries };
 }
 
+// ---- encrypted pCloud token ----
+// The token is never stored or sent in clear. "pcloud settoken" encrypts it in this page (AES-256-GCM, key from
+// a passphrase via PBKDF2, both built into the browser) and stores only the encrypted blob on the device as
+// /token.enc. The ESP32 just stores and forwards the blob and can never read the token. The passphrase is typed
+// here and never leaves this page.
+const TOKEN_FILE = '/token.enc';
+const PBKDF2_ITER = 200000;
+let credCache = null;        // decrypted { token, apiHost }, kept in memory until the connection closes
+
+const b64 = bytes => btoa(String.fromCharCode(...bytes));
+const unb64 = str => Uint8Array.from(atob(str), c => c.charCodeAt(0));
+
+function askText(title, opts = {}) {      // small dialog; resolves with the text, or null if cancelled
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;' +
+                            'justify-content:center;z-index:1000;padding:16px';
+    const box = document.createElement('div');
+    box.style.cssText = 'background:#fff;color:#222;border-radius:10px;padding:16px;max-width:420px;width:100%;' +
+                        'box-shadow:0 8px 24px rgba(0,0,0,.4);font-family:system-ui,sans-serif';
+    const h = document.createElement('div');
+    h.textContent = title;
+    h.style.cssText = 'font-weight:600;margin-bottom:10px';
+    const inp = document.createElement('input');
+    inp.type = opts.secret ? 'password' : 'text';
+    inp.value = opts.value || '';
+    inp.autocomplete = 'off';
+    inp.style.cssText = 'width:100%;box-sizing:border-box;padding:10px;font-size:16px;border:1px solid #999;border-radius:6px';
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;margin-top:12px';
+    const mk = (label, primary) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.style.cssText = 'padding:8px 16px;font-size:15px;border:0;border-radius:6px;cursor:pointer;' +
+                        (primary ? 'background:#0062C6;color:#fff' : 'background:#ddd;color:#222');
+      return b;
+    };
+    const cancel = mk('Cancel', false), ok = mk('OK', true);
+    const done = v => { overlay.remove(); resolve(v); };
+    cancel.onclick = () => done(null);
+    ok.onclick = () => done(inp.value);
+    inp.addEventListener('keydown', e => {
+      if (e.key === 'Enter') done(inp.value);
+      if (e.key === 'Escape') done(null);
+    });
+    row.append(cancel, ok);
+    box.append(h, inp, row);
+    overlay.append(box);
+    document.body.append(overlay);
+    inp.focus();
+  });
+}
+
+function needCrypto() {
+  if (!window.crypto || !crypto.subtle) {
+    throw new Error('this browser feature needs a secure page (https:// or localhost)');
+  }
+}
+
+async function deriveTokenKey(pass, salt, iter) {
+  needCrypto();
+  if (!(iter >= 10000 && iter <= 2000000)) throw new Error('unsupported key derivation settings');
+  const base = await crypto.subtle.importKey('raw', encoder.encode(pass), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: iter, hash: 'SHA-256' }, base,
+                                 { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+
+async function encryptToken(plain, pass) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveTokenKey(pass, salt, PBKDF2_ITER);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoder.encode(plain)));
+  return JSON.stringify({ v: 1, kdf: 'PBKDF2-SHA256', iter: PBKDF2_ITER, salt: b64(salt), iv: b64(iv), ct: b64(ct) });
+}
+
+async function decryptToken(meta, pass) {
+  const key = await deriveTokenKey(pass, unb64(meta.salt), meta.iter);
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(meta.iv) }, key, unb64(meta.ct));
+  return decoder.decode(plain);
+}
+
+// Token and API host for the pCloud commands: asks the device for the stored data and decrypts it here.
+async function getPcloudCredentials() {
+  if (credCache) return credCache;
+  const reply = await request('token');
+  const text = new TextDecoder().decode(reply.data).trim();
+  let plain;
+  if (text.startsWith('{')) {                       // encrypted token file
+    let meta;
+    try { meta = JSON.parse(text); } catch (e) { throw new Error('the token file on the device is damaged'); }
+    if (meta.v !== 1) throw new Error('unknown token file version');
+    for (let attempt = 1; ; attempt++) {
+      const pass = await askText('Passphrase for the pCloud token', { secret: true });
+      if (pass === null) throw new Error('cancelled, no passphrase entered');
+      try { plain = await decryptToken(meta, pass); break; }
+      catch (e) {
+        if (e.message && /secure page|unsupported/.test(e.message)) throw e;
+        log('Wrong passphrase.\n', 'error');
+        if (attempt >= 3) throw new Error('wrong passphrase');
+      }
+    }
+  } else {                                          // old unencrypted /token.txt
+    plain = text;
+    log('Warning: this token is stored and sent unencrypted. Run "pcloud settoken" to store it encrypted.\n', 'error');
+  }
+  const [token, host] = plain.split('\n').map(x => x.trim());
+  if (!token) throw new Error('no token found');
+  credCache = { token, apiHost: host || 'eapi.pcloud.com' };
+  return credCache;
+}
+
+// pcloud settoken: encrypt a pCloud token with a passphrase and store it on the device
+async function runSetToken() {
+  try { needCrypto(); } catch (e) { log(e.message + '\n', 'error'); return; }
+  const token = await askText('pCloud access token (hidden)', { secret: true });
+  if (!token || !token.trim()) { log('Cancelled.\n', 'sys'); return; }
+  const host = await askText('pCloud API host', { value: 'eapi.pcloud.com' });
+  if (!host || !host.trim()) { log('Cancelled.\n', 'sys'); return; }
+  const pass1 = await askText('Choose a passphrase (at least 12 characters)', { secret: true });
+  if (!pass1) { log('Cancelled.\n', 'sys'); return; }
+  if (pass1.length < 12) { log('The passphrase is too short: use at least 12 characters (a few random words are fine).\n', 'error'); return; }
+  const pass2 = await askText('Repeat the passphrase', { secret: true });
+  if (pass1 !== pass2) { log('The passphrases do not match, nothing was stored.\n', 'error'); return; }
+
+  swallowPrompts = true;
+  try {
+    log('Encrypting the token...\n', 'sys');
+    const blob = await encryptToken(token.trim() + '\n' + host.trim(), pass1);
+    await putFile(TOKEN_FILE, encoder.encode(blob));
+    credCache = null;
+    log('Encrypted token stored as ' + TOKEN_FILE + ' on the device. Remember the passphrase: it cannot be recovered.\n', 'sys');
+  } catch (e) {
+    log('Could not store the token: ' + e.message + '\n', 'error');
+  } finally {
+    swallowPrompts = false;
+  }
+}
+
 // pcloud <file> [folderid]: the browser does the upload, the ESP32 only supplies data
 async function runPcloudPut(args) {
   const path = args[0];
@@ -368,6 +507,7 @@ async function runPcloudPut(args) {
   if (!path || !/^\d+$/.test(folderId)) {
     log('usage: pcloud put <file> [folderid]   (folderid 0 = root)\n' +
         '       pcloud get <path in pCloud> [device file]\n' +
+        '       pcloud settoken   (store your pCloud token encrypted on the device)\n' +
         '       upload [device file]   (choose a file on this computer)\n', 'error');
     return;
   }
@@ -377,9 +517,7 @@ async function runPcloudPut(args) {
   swallowPrompts = true;
   try {
     log('Fetching token from the device...\n', 'sys');
-    const tok = await request('token');
-    const [token, host] = new TextDecoder().decode(tok.data).split('\n').map(x => x.trim());
-    const apiHost = host || 'eapi.pcloud.com';
+    const { token, apiHost } = await getPcloudCredentials();
 
     s.step = 'receive';
     const t0 = performance.now();
@@ -593,9 +731,7 @@ async function runPcloudGet(args) {
   swallowPrompts = true;
   try {
     log('Fetching token from the device...\n', 'sys');
-    const tok = await request('token');
-    const [token, host] = new TextDecoder().decode(tok.data).split('\n').map(x => x.trim());
-    const apiHost = host || 'eapi.pcloud.com';
+    const { token, apiHost } = await getPcloudCredentials();
 
     s.step = 'link';
     log('Asking pCloud for a download link...\n', 'sys');
@@ -671,6 +807,7 @@ async function runUpload(text) {
 // pcloud put <file> [folderid]  |  pcloud get <remote> [device file]  |  pcloud <file> [folderid]
 async function runPcloud(text) {
   const args = parseArgs(text).slice(1);
+  if (args[0] === 'settoken') return runSetToken();
   if (args[0] === 'get') return runPcloudGet(args.slice(1));
   if (args[0] === 'put') return runPcloudPut(args.slice(1));
   return runPcloudPut(args);
@@ -682,6 +819,8 @@ function onDisconnected() {
   finishPending(gone);
   writeChunk = 20;
   log('\nDisconnected.\n', 'sys');
+  lastDisconnectAt = Date.now();
+  credCache = null;
   setConnected(false);
   rxChar = txChar = null;
 }
@@ -707,12 +846,57 @@ async function openSession() {
   log('Tip: "pcloud put <file>" uploads a device file to pCloud, "upload" copies a file from this computer to the device.\n', 'sys');
 }
 
+// Try to open a session several times. Android's Bluetooth stack sometimes fails a connection
+// attempt for no good reason ("Connection attempt failed"); an immediate retry usually works.
+async function connectWithRetries(maxTries) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxTries; attempt++) {
+    try {
+      await openSession();
+      return;
+    } catch (e) {
+      lastErr = e;
+      // A plain "connection attempt failed" is a one-off: retry quickly. Anything else may be pairing in
+      // progress (on Android, look for the passkey request in the notification area): wait longer.
+      const quick = /connection attempt failed/i.test(e.message);
+      log('Attempt ' + attempt + ' of ' + maxTries + ' failed (' + e.name + ': ' + e.message + ').\n', 'error');
+      try { if (device.gatt.connected) device.gatt.disconnect(); } catch (ignored) {}
+      if (attempt < maxTries) {
+        const waitMs = quick ? 1500 : 5000;
+        if (!quick) log('If your phone asks for a passkey, enter it now.\n', 'sys');
+        log('Retrying in ' + (waitMs / 1000) + ' s...\n', 'sys');
+        await sleep(waitMs);
+      }
+    }
+  }
+  throw lastErr;
+}
+
 async function connect(showAll = false) {
   if (!navigator.bluetooth) {
     log('Web Bluetooth is not available. Use Chrome or Edge on desktop or Android.\n', 'error');
     return;
   }
   try {
+    // Give Android a moment after the last session ended; reconnecting instantly fails more often.
+    const sinceLast = Date.now() - lastDisconnectAt;
+    if (sinceLast < 2000) await sleep(2000 - sinceLast);
+
+    // Reconnect to the device chosen a moment ago without scanning again (fewer Android scan problems).
+    // After two minutes, or with "All devices", the device dialog is shown again.
+    const canReuse = device && !device.gatt.connected && !showAll && lastDisconnectAt &&
+                     (Date.now() - lastDisconnectAt < 120000);
+    if (canReuse) {
+      log('Reconnecting to ' + (device.name || 'the last device') + '...\n', 'sys');
+      try {
+        await connectWithRetries(3);
+        return;
+      } catch (e) {
+        log('Reconnect failed, please choose the device again.\n', 'sys');
+        device = null;
+      }
+    }
+
     log('Choose your ESP32-S3 in the Bluetooth dialog...\n', 'sys');
     // Normal mode only lists devices whose advertised name starts with "ESP32".
     // "All devices" lists every BLE device, which helps when a board does not show up.
@@ -720,24 +904,7 @@ async function connect(showAll = false) {
       ? { acceptAllDevices: true, optionalServices: [NUS_SERVICE] }
       : { filters: [{ namePrefix: 'ESP32' }], optionalServices: [NUS_SERVICE] });
     device.addEventListener('gattserverdisconnected', onDisconnected);
-
-    try {
-      await openSession();
-    } catch (e1) {
-      // First connection after a fresh install: the OS pairs in the middle of the first protected
-      // access (on Android, look for the passkey request in the notification area), and the link is
-      // often dropped when pairing completes. Wait a moment and try once more with the new bond.
-      // A plain "connection attempt failed" is usually a one-off on Android: retry quickly.
-      // Anything else may be pairing in progress: give the passkey dialog more time.
-      const quick = /connection attempt failed/i.test(e1.message);
-      const waitMs = quick ? 1500 : 5000;
-      log('First attempt failed (' + e1.name + ': ' + e1.message + ').\n', 'error');
-      if (!quick) log('If your phone asks for a passkey (check the notification area), enter it now.\n', 'sys');
-      log('Retrying in ' + (waitMs / 1000) + ' s...\n', 'sys');
-      try { if (device.gatt.connected) device.gatt.disconnect(); } catch (ignored) {}
-      await sleep(waitMs);
-      await openSession();
-    }
+    await connectWithRetries(4);
   } catch (e) {
     log('Connection failed: ' + e.name + ': ' + e.message + '\n', 'error');
     if (/No Services matching/i.test(e.message)) {
