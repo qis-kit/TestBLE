@@ -518,17 +518,145 @@ async function runSetToken() {
   }
 }
 
+// ---- pcloud put <directory>: upload all files below a directory, keeping the folder structure ----
+const normPath = p => '/' + p.split('/').filter(Boolean).join('/');          // "/a/b"; the root becomes "/"
+const dirOf = p => p.slice(0, p.lastIndexOf('/'));                           // "/a/b/c.txt" -> "/a/b"
+
+async function pcloudCall(apiHost, method, params) {
+  let res, json;
+  try { res = await fetch('https://' + apiHost + '/' + method, { method: 'POST', body: new URLSearchParams(params) }); }
+  catch (e) { throw new Error('could not reach the server (offline, blocked, or CORS; see the browser console)'); }
+  try { json = await res.json(); }
+  catch (e) { throw new Error('unexpected reply from pCloud (HTTP ' + res.status + ')'); }
+  if (json.result !== 0) throw new Error('pCloud error ' + json.result + ': ' + (json.error || 'unknown'));
+  return json;
+}
+
+async function runPcloudPutDir(path, parentFolderId) {
+  const base = normPath(path);                         // "/" for the whole file system
+  const rootName = base === '/' ? 'LittleFS' : base.slice(base.lastIndexOf('/') + 1);
+  const baseKey = base === '/' ? '' : base;            // so that dirOf("/a.txt") === baseKey for the root
+  const T = { ok: 0, bytes: 0, failed: [], skipped: [], total: 0, totalBytes: 0 };
+  const t0 = performance.now();
+  swallowPrompts = true;
+  let fatal = null;
+  try {
+    log('Fetching token from the device...\n', 'sys');
+    const { token, apiHost } = await getPcloudCredentials();
+
+    log('Listing files in ' + base + '...\n', 'sys');
+    const reply = await request('flist ' + base);
+    const files = [];
+    for (const line of new TextDecoder().decode(reply.data).split('\n')) {
+      if (!line) continue;
+      if (line[0] === '!') { T.skipped.push(line.slice(2)); continue; }
+      const sp = line.indexOf(' ');
+      files.push({ size: parseInt(line.slice(0, sp), 10) || 0, path: line.slice(sp + 1) });
+    }
+    T.total = files.length;
+    T.totalBytes = files.reduce((n, f) => n + f.size, 0);
+    if (!files.length) { log('No files to upload in ' + base + '.\n', 'sys'); return; }
+
+    log('Uploading ' + files.length + ' file(s), ' + fmt(T.totalBytes) + ' bytes, from ' + base +
+        ' to the pCloud folder "' + rootName + '" (inside folder ' + parentFolderId + ')\n', 'sys');
+
+    // pCloud folder for every device directory, created on demand
+    const ids = new Map();
+    const folderFor = async dirPath => {
+      if (ids.has(dirPath)) return ids.get(dirPath);
+      let parentId, name;
+      if (dirPath === baseKey) { parentId = parentFolderId; name = rootName; }
+      else { parentId = await folderFor(dirOf(dirPath)); name = dirPath.slice(dirPath.lastIndexOf('/') + 1); }
+      const r = await pcloudCall(apiHost, 'createfolderifnotexists',
+                                 { access_token: token, folderid: String(parentId), name });
+      const id = String(r.metadata.folderid);
+      ids.set(dirPath, id);
+      return id;
+    };
+
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      const tag = '[' + (i + 1) + '/' + files.length + '] ';
+      const el = log('', 'sys');                       // one line per file, updated in place
+      let lastDraw = 0;
+      const draw = (text, force) => {
+        const now = performance.now();
+        if (!force && now - lastDraw < 150) return;
+        lastDraw = now;
+        el.textContent = tag + f.path + ': ' + text + '\n';
+        out.scrollTop = out.scrollHeight;
+      };
+      try {
+        draw('receiving...', true);
+        const t1 = performance.now();
+        const file = await fetchFile(f.path, {
+          onBegin: size => draw('receiving 0 of ' + fmt(size) + ' bytes', true),
+          onProgress: (got, size) => draw('receiving ' + fmt(got) + ' of ' + fmt(size) + ' bytes')
+        });
+        const recvMs = performance.now() - t1;
+        const len = file.data.length;
+
+        const folder = await folderFor(dirOf(f.path));
+        draw('uploading 0 of ' + fmt(len) + ' bytes', true);
+        const form = new FormData();                   // parameters first, then the file, as pCloud requires
+        form.append('access_token', token);
+        form.append('folderid', folder);
+        form.append('nopartial', '1');
+        form.append('file', new Blob([file.data]), file.name);
+        const t2 = performance.now();
+        const res = await postWithProgress('https://' + apiHost + '/uploadfile', form, (loaded, total) =>
+          draw('uploading ' + fmt(Math.min(len, Math.round(loaded / total * len))) + ' of ' + fmt(len) + ' bytes'));
+        const upMs = performance.now() - t2;
+        let json;
+        try { json = JSON.parse(res.text); }
+        catch (e) { throw new Error('unexpected reply from pCloud (HTTP ' + res.status + ')'); }
+        if (json.result !== 0) throw new Error('pCloud error ' + json.result + ': ' + (json.error || 'unknown'));
+
+        T.ok++;
+        T.bytes += len;
+        draw(fmt(len) + ' bytes uploaded (BLE' + rate(len, recvMs) + '; pCloud' + rate(len, upMs) + ')', true);
+      } catch (e) {
+        T.failed.push(f.path + ': ' + e.message);
+        el.className = 'error';
+        draw('FAILED: ' + e.message, true);
+        if (!device || !device.gatt.connected) throw new Error('the Bluetooth connection was lost');
+      }
+    }
+  } catch (e) {
+    fatal = e;
+    log('Directory upload stopped: ' + e.message + '\n', 'error');
+  } finally {
+    swallowPrompts = false;
+  }
+
+  const allOk = !fatal && T.failed.length === 0;
+  const L = [allOk ? 'Summary: SUCCESS' : (T.ok ? 'Summary: PARTIAL' : 'Summary: FAILED')];
+  L.push('  Folder:  ' + base + ' -> pCloud "' + rootName + '" (inside folder ' + parentFolderId + ')');
+  L.push('  Files:   ' + T.ok + ' of ' + T.total + ' uploaded, ' + fmt(T.bytes) + ' of ' + fmt(T.totalBytes) + ' bytes, ' + secs(performance.now() - t0));
+  if (T.skipped.length) L.push('  Skipped: ' + T.skipped.length + ' file(s) with a space in the name: ' + T.skipped.join(', '));
+  for (const f of T.failed) L.push('  Failed:  ' + f);
+  log(L.join('\n') + '\n', allOk ? 'sys' : 'error');
+}
+
 // pcloud <file> [folderid]: the browser does the upload, the ESP32 only supplies data
 async function runPcloudPut(args) {
   const path = args[0];
   const folderId = args[1] === undefined ? '0' : args[1];
   if (!path || !/^\d+$/.test(folderId)) {
-    log('usage: pcloud put <file> [folderid]   (folderid 0 = root)\n' +
+    log('usage: pcloud put <file or directory> [folderid]   (folderid 0 = root)\n' +
         '       pcloud get <path in pCloud> [device file]\n' +
         '       pcloud settoken   (store your pCloud token encrypted on the device)\n' +
-        '       upload [device file]   (choose a file on this computer)\n', 'error');
+        '       upload [device file or directory/]   (choose one or more files on this computer)\n', 'error');
     return;
   }
+
+  // A directory? "get <path> 0 0" answers "is a directory" without sending any data, and works for files too.
+  let isDir = false;
+  swallowPrompts = true;
+  try { await request('get ' + path + ' 0 0'); }
+  catch (e) { isDir = /is a directory/i.test(e.message); }
+  finally { swallowPrompts = false; }
+  if (isDir) return runPcloudPutDir(path, folderId);
 
   const s = { step: 'token', file: path, size: 0, received: 0, uploaded: 0, recvMs: 0, upMs: 0, retries: 0 };
   let recv = null, up = null;
@@ -659,12 +787,13 @@ function parseArgs(text) {    // words separated by spaces; "double quotes" keep
   return out;
 }
 
-function pickFile() {         // must be called straight from the Enter key press (user gesture)
+function pickFiles() {        // must be called straight from the Enter key press (user gesture)
   return new Promise(resolve => {
     const input = document.createElement('input');
     input.type = 'file';
-    input.addEventListener('change', () => resolve(input.files[0] || null));
-    input.addEventListener('cancel', () => resolve(null));
+    input.multiple = true;      // one or more files can be chosen
+    input.addEventListener('change', () => resolve(Array.from(input.files)));
+    input.addEventListener('cancel', () => resolve([]));
     input.click();
   });
 }
@@ -797,11 +926,77 @@ async function runPcloudGet(args) {
 }
 
 // upload [device file]: choose a file on this computer and copy it to the device's LittleFS
+// upload [directory/] with several files chosen: every file goes into the directory (created if missing)
+async function runUploadMany(files, target) {
+  const dir = '/' + target.split('/').filter(Boolean).join('/');      // "/" or "/a/b"
+  if (/\s/.test(dir)) { log('Device names cannot contain spaces. Use: upload /directory/\n', 'error'); return; }
+  const T = { ok: 0, bytes: 0, failed: [], skipped: [] };
+  const totalBytes = files.reduce((n, f) => n + f.size, 0);
+  log('Sending ' + files.length + ' file(s), ' + fmt(totalBytes) + ' bytes, to ' + dir + '\n', 'sys');
+  const t0 = performance.now();
+  let fatal = null;
+  swallowPrompts = true;
+  try {
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      const local = (dir === '/' ? '' : dir) + '/' + f.name;
+      const tag = '[' + (i + 1) + '/' + files.length + '] ';
+      const el = log('', 'sys');                      // one line per file, updated in place
+      let lastDraw = 0;
+      const draw = (text, force) => {
+        const now = performance.now();
+        if (!force && now - lastDraw < 150) return;
+        lastDraw = now;
+        el.textContent = tag + local + ': ' + text + '\n';
+        out.scrollTop = out.scrollHeight;
+      };
+      if (/\s/.test(f.name)) {
+        T.skipped.push(f.name);
+        el.className = 'error';
+        draw('skipped (device file names cannot contain spaces)', true);
+        continue;
+      }
+      try {
+        draw('reading...', true);
+        const data = new Uint8Array(await f.arrayBuffer());
+        const t1 = performance.now();
+        const r = await putFile(local, data, { onProgress: (done, total) => draw('sending ' + fmt(done) + ' of ' + fmt(total) + ' bytes') });
+        T.ok++;
+        T.bytes += data.length;
+        draw(fmt(data.length) + ' bytes sent, checksums OK' + rate(data.length, performance.now() - t1) + retryText(r.retries), true);
+      } catch (e) {
+        T.failed.push(local + ': ' + e.message);
+        el.className = 'error';
+        draw('FAILED: ' + e.message, true);
+        if (!device || !device.gatt.connected) throw new Error('the Bluetooth connection was lost');
+      }
+    }
+  } catch (e) {
+    fatal = e;
+    log('Upload stopped: ' + e.message + '\n', 'error');
+  } finally {
+    swallowPrompts = false;
+  }
+
+  const allOk = !fatal && T.failed.length === 0 && T.skipped.length === 0;
+  const L = [allOk ? 'Summary: SUCCESS' : (T.ok ? 'Summary: PARTIAL' : 'Summary: FAILED')];
+  L.push('  To:      ' + dir);
+  L.push('  Files:   ' + T.ok + ' of ' + files.length + ' sent, ' + fmt(T.bytes) + ' of ' + fmt(totalBytes) + ' bytes, ' + secs(performance.now() - t0));
+  if (T.skipped.length) L.push('  Skipped: ' + T.skipped.join(', ') + ' (spaces in the name)');
+  for (const f of T.failed) L.push('  Failed:  ' + f);
+  log(L.join('\n') + '\n', allOk ? 'ok' : 'error');
+}
+
 async function runUpload(text) {
-  const filePromise = pickFile();     // open the picker right away, while the key press still counts
+  const filesPromise = pickFiles();   // open the picker right away, while the key press still counts
   const args = parseArgs(text).slice(1);
-  const file = await filePromise;
-  if (!file) { log('No file chosen.\n', 'sys'); return; }
+  const files = await filesPromise;
+  if (!files.length) { log('No file chosen.\n', 'sys'); return; }
+  const target = args[0] || '';
+  // several files, or a target that ends with "/": the target is a directory on the device
+  if (files.length > 1 || target.endsWith('/')) return runUploadMany(files, target);
+
+  const file = files[0];
   let local = args[0] || '/' + file.name;
   if (!local.startsWith('/')) local = '/' + local;
   if (/\s/.test(local)) {
@@ -861,7 +1056,7 @@ async function openSession() {
   const offsetMin = -new Date().getTimezoneOffset();
   log('Syncing time...\n', 'sys');
   await write('time ' + epoch + ' ' + offsetMin + '\n');
-  log('Tip: "pcloud put <file>" uploads a device file to pCloud, "upload" copies a file from this computer to the device.\n', 'sys');
+  log('Tip: "pcloud put <file>" uploads a device file to pCloud, "upload" copies one or more files from this computer to the device.\n', 'sys');
 }
 
 // Try to open a session several times. Android's Bluetooth stack sometimes fails a connection
